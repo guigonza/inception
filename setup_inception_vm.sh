@@ -246,11 +246,6 @@ EXPOSE 3306
 CMD ["/usr/local/bin/entrypoint.sh"]
 EOF
 
-cat > "$TARGET_DIR/srcs/requirements/mariadb/.dockerignore" <<'EOF'
-conf
-tools
-EOF
-
 cat > "$TARGET_DIR/srcs/requirements/mariadb/conf/my.cnf" <<'EOF'
 [mysqld]
 user = mysql
@@ -310,10 +305,6 @@ RUN curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-
 
 EXPOSE 9000
 CMD ["/usr/local/bin/entrypoint.sh"]
-EOF
-
-cat > "$TARGET_DIR/srcs/requirements/wordpress/.dockerignore" <<'EOF'
-tools
 EOF
 
 # Quoted heredoc for the same reason as the mariadb entrypoint: ${...} references are
@@ -394,10 +385,6 @@ RUN mkdir -p /etc/nginx/certs /var/www/html
 
 EXPOSE 443
 CMD ["/usr/local/bin/entrypoint.sh"]
-EOF
-
-cat > "$TARGET_DIR/srcs/requirements/nginx/.dockerignore" <<'EOF'
-tools
 EOF
 
 # Unquoted heredoc so ${DOMAIN_NAME} is baked in now (nginx.conf is a static file, never

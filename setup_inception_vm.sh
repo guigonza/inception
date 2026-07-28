@@ -10,8 +10,6 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
-TARGET_DIR="${1:-$HOME/inception}"
-TARGET_DIR="$(realpath -m "$TARGET_DIR")"
 LOGNAME_VALUE="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
 HOST_USER="${SUDO_USER:-${USER:-root}}"
 HOST_HOME="$(getent passwd "$HOST_USER" 2>/dev/null | cut -d: -f6 || echo "/home/$HOST_USER")"
@@ -23,6 +21,12 @@ fi
 if [[ -z "${LOGNAME_VALUE}" ]]; then
   LOGNAME_VALUE="root"
 fi
+
+# Built from HOST_HOME (resolved via getent, not the shell's $HOME) so the default target
+# is always /home/<login>/inception even if this script is invoked from a root shell
+# (e.g. after `sudo -i`), where $HOME would already be /root.
+TARGET_DIR="${1:-$HOST_HOME/inception}"
+TARGET_DIR="$(realpath -m "$TARGET_DIR")"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -128,24 +132,51 @@ data/
 EOF
 
 cat > "$TARGET_DIR/Makefile" <<'EOF'
-.PHONY: up down build logs clean fclean re
+COMPOSE = docker compose -f srcs/docker-compose.yml --env-file srcs/.env
 
 all: up
 
 up:
-	docker compose -f srcs/docker-compose.yml --env-file srcs/.env up -d --build
+	$(COMPOSE) up -d --build
 
 down:
-	docker compose -f srcs/docker-compose.yml --env-file srcs/.env down
+	$(COMPOSE) down
+
+stop:
+	$(COMPOSE) stop
+
+restart:
+	$(COMPOSE) restart
+
 build:
-	docker compose -f srcs/docker-compose.yml --env-file srcs/.env build
+	$(COMPOSE) build
+
 logs:
-	docker compose -f srcs/docker-compose.yml --env-file srcs/.env logs -f
+	$(COMPOSE) logs -f
+
+ps:
+	$(COMPOSE) ps
+
+images:
+	$(COMPOSE) images
+
+volumes:
+	docker volume ls
+	docker volume inspect srcs_mariadb_data srcs_wordpress_data
+
+networks:
+	docker network ls
+	docker network inspect srcs_inception
+
 clean:
-	docker compose -f srcs/docker-compose.yml --env-file srcs/.env down -v
+	$(COMPOSE) down -v
+
 fclean: clean
 	rm -rf $(PWD)/data
+
 re: fclean up
+
+.PHONY: up down stop restart build logs ps images volumes networks clean fclean re
 EOF
 
 # docker-compose.yml is generated (not executed as a shell script), so $HOST_HOME
@@ -457,19 +488,15 @@ Docker network, persisting data with named volumes, and keeping secrets out of t
 image and out of version control.
 
 ## Instructions
-Prerequisites: a Linux VM (Debian/Ubuntu), sudo access.
+Prerequisites: a Linux VM (Debian/Ubuntu) with Docker Engine and the Docker Compose
+plugin installed, this repository cloned onto it, and \`srcs/.env\` plus \`secrets/\`
+in place (see [DEV_DOC.md](DEV_DOC.md) for the exact files and variables required).
 
-1. Clone this repository onto the VM.
-2. Bootstrap the environment (installs Docker, generates \`srcs/.env\` and \`secrets/\`,
-   adds \`${DOMAIN_NAME}\` to \`/etc/hosts\`):
-   \`\`\`
-   sudo bash setup_inception_vm.sh "\$(pwd)"
-   \`\`\`
-3. Build and start the stack:
+1. Build and start the stack:
    \`\`\`
    make up
    \`\`\`
-4. Open https://${DOMAIN_NAME} in a browser running on the VM.
+2. Open https://${DOMAIN_NAME} in a browser running on the VM.
 
 See [USER_DOC.md](USER_DOC.md) for day-to-day usage and [DEV_DOC.md](DEV_DOC.md) for
 environment setup and development details.
@@ -483,14 +510,9 @@ environment setup and development details.
 - [MariaDB Docker deployment notes](https://mariadb.com/kb/en/installing-mariadb-with-docker/)
 - The 42 Inception project subject (provided by the school)
 
-**AI usage:** Claude (Anthropic) was used as a reviewer/pair-programmer for the
-\`setup_inception_vm.sh\` provisioning script: it reviewed the script against the project
-subject, identified functional bugs (unquoted heredocs causing NGINX/PHP-FPM variables
-and the Makefile's \`\$(PWD)\` to be expanded too early, and a MariaDB remote-auth issue
-that broke the WordPress startup wait-loop), rewired credential handling to use real
-Docker secrets instead of hardcoded values, and drafted this README and the
-USER_DOC.md/DEV_DOC.md files. All generated code and docs were reviewed and adjusted by
-the author before use; no AI tool had access to real secrets or the VM.
+**AI usage:** AI was used to search for information and resolve doubts about Docker,
+Docker Compose, NGINX/TLS configuration, and WordPress/MariaDB setup while working on
+this project.
 
 ## Project description: Docker and design choices
 All three services (nginx, wordpress, mariadb) are built from \`debian:12-slim\`
@@ -553,11 +575,17 @@ Run these from the repository root (where the \`Makefile\` is):
 |---|---|
 | Build and start everything | \`make up\` (alias: \`make\`) |
 | Stop containers (keep data) | \`make down\` |
+| Stop without removing containers | \`make stop\` |
+| Restart all services | \`make restart\` |
 | Rebuild images | \`make build\` |
+| Container status | \`make ps\` |
+| List built images (check names match services) | \`make images\` |
+| Inspect the named volumes | \`make volumes\` |
+| Inspect the docker network | \`make networks\` |
+| Follow container logs | \`make logs\` |
 | Stop and remove containers + network | \`make clean\` |
 | Full reset, including \`/home/${LOGNAME_VALUE}/data\` | \`make fclean\` |
 | Full reset then restart | \`make re\` |
-| Follow container logs | \`make logs\` |
 
 ## Accessing the website and the admin panel
 - Website: https://${DOMAIN_NAME}
@@ -574,16 +602,16 @@ Nothing is hardcoded — every password lives in a local file, none of it in git
 - \`secrets/credentials.txt\` — \`WP_ADMIN_PASSWORD\` and \`WP_USER_PASSWORD\` for the two
   WordPress accounts: \`${WP_ADMIN_USER}\` (administrator) and \`${WP_USER}\` (regular user).
 
-These files are created once by \`setup_inception_vm.sh\` and are listed in \`.gitignore\`,
-so they only ever exist on disk, never in the repository.
+These files are listed in \`.gitignore\`, so they only ever exist on disk, never in the
+repository.
 
 ## Checking that everything is running correctly
 \`\`\`
-docker compose -f srcs/docker-compose.yml ps      # all three should show "running"
-docker compose -f srcs/docker-compose.yml logs -f # tail logs for all services
-docker network ls                                  # "inception" network should exist
-docker volume ls                                    # mariadb_data / wordpress_data should exist
-curl -vk https://${DOMAIN_NAME}                     # -k: ignore the self-signed cert
+make ps                          # all three should show "running"
+make logs                        # tail logs for all services
+make networks                    # "inception" network should exist
+make volumes                     # mariadb_data / wordpress_data should exist
+curl -vk https://${DOMAIN_NAME}  # -k: ignore the self-signed cert
 \`\`\`
 EOF
 
@@ -591,44 +619,57 @@ cat > "$TARGET_DIR/DEV_DOC.md" <<EOF
 # Developer Documentation
 
 ## Setting up the environment from scratch
-Prerequisites: a Debian/Ubuntu VM with sudo access, this repository cloned onto it.
+Prerequisites: a Debian/Ubuntu host with Docker Engine and the Docker Compose plugin
+installed, this repository cloned onto it.
 
 Nothing sensitive is committed to git (see \`.gitignore\`: \`.env\`, \`secrets/*\`, \`data/\`),
-so a fresh clone needs \`srcs/.env\` and \`secrets/*.txt\` generated before anything can run.
-\`setup_inception_vm.sh\` does this in one step:
+so a fresh clone needs the following created locally before anything can run:
 
-\`\`\`
-sudo bash setup_inception_vm.sh "\$(pwd)"
-\`\`\`
-
-This installs Docker (if missing), writes \`srcs/.env\` (domain, DB name, usernames — no
-passwords), generates random passwords into \`secrets/db_password.txt\`,
-\`secrets/db_root_password.txt\` and \`secrets/credentials.txt\`, creates the
-\`/home/${LOGNAME_VALUE}/data/{mariadb,wordpress}\` directories that back the named
-volumes, and adds \`${DOMAIN_NAME}\` to \`/etc/hosts\` pointing at \`127.0.0.1\`.
-
-Re-running the script overwrites the \`srcs/\` tree (Dockerfiles, configs, compose file)
-from its built-in templates — treat it as the source of truth for the infrastructure
-code, and edit the templates inside the script (or the generated files, then port the
-change back) rather than hand-editing \`srcs/\` and re-running the script afterward.
+1. The two directories backing the named volumes:
+   \`\`\`
+   mkdir -p /home/${LOGNAME_VALUE}/data/mariadb /home/${LOGNAME_VALUE}/data/wordpress
+   \`\`\`
+2. \`srcs/.env\` (non-secret configuration):
+   \`\`\`
+   DOMAIN_NAME=${DOMAIN_NAME}
+   MYSQL_DATABASE=${MYSQL_DATABASE}
+   MYSQL_USER=${MYSQL_USER}
+   WP_ADMIN_USER=${WP_ADMIN_USER}
+   WP_ADMIN_EMAIL=${WP_ADMIN_EMAIL}
+   WP_TITLE=${WP_TITLE}
+   WP_USER=${WP_USER}
+   \`\`\`
+3. \`secrets/db_root_password.txt\` and \`secrets/db_password.txt\`, each containing a single
+   password, and \`secrets/credentials.txt\` with:
+   \`\`\`
+   WP_ADMIN_PASSWORD=<password>
+   WP_USER_PASSWORD=<password>
+   \`\`\`
+4. \`${DOMAIN_NAME}\` added to \`/etc/hosts\`, pointing at \`127.0.0.1\`.
 
 ## Building and launching
 \`\`\`
-make up      # docker compose ... up -d --build
-make build   # build images without starting containers
-make down    # stop containers, keep volumes/network
-make logs    # follow logs
+make up        # docker compose ... up -d --build
+make build     # build images without starting containers
+make down      # stop containers, keep volumes/network
+make stop      # stop containers without removing them
+make restart   # restart all services
+make logs      # follow logs
+make ps        # container status
+make images    # list built images
+make volumes   # docker volume ls/inspect
+make networks  # docker network ls/inspect
 \`\`\`
 The \`Makefile\` always passes \`--env-file srcs/.env\` explicitly, so \`make\` works from the
 repo root regardless of shell working directory assumptions.
 
 ## Managing containers and volumes
 \`\`\`
-docker compose -f srcs/docker-compose.yml ps
+make ps
+make networks
+make volumes
 docker compose -f srcs/docker-compose.yml exec wordpress bash
 docker compose -f srcs/docker-compose.yml exec mariadb bash
-docker network inspect inception
-docker volume inspect srcs_mariadb_data srcs_wordpress_data   # names may be prefixed by the compose project
 \`\`\`
 
 ## Where data lives and how it persists

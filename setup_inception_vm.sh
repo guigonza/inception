@@ -133,6 +133,7 @@ EOF
 
 cat > "$TARGET_DIR/Makefile" <<'EOF'
 COMPOSE = docker compose -f srcs/docker-compose.yml --env-file srcs/.env
+DOMAIN  = $(shell grep -m1 '^DOMAIN_NAME=' srcs/.env | cut -d= -f2)
 
 all: up
 
@@ -168,6 +169,32 @@ networks:
 	docker network ls
 	docker network inspect srcs_inception
 
+check-tls:
+	curl -vk https://$(DOMAIN) 2>&1 | grep -i "SSL connection\|subject\|TLSv"
+	@echo "--- TLS 1.2 (must succeed) ---"
+	openssl s_client -connect $(DOMAIN):443 -tls1_2 </dev/null 2>&1 | grep -i "Verify\|Protocol"
+	@echo "--- TLS 1.1 (must fail) ---"
+	-openssl s_client -connect $(DOMAIN):443 -tls1_1 </dev/null 2>&1 | grep -i "handshake failure\|no protocols"
+	@echo "--- Port 80 (must be refused, nginx only publishes 443) ---"
+	-curl -sv http://$(DOMAIN) 2>&1 | grep -i "connection refused\|failed to connect"
+
+check-wp:
+	$(COMPOSE) exec wordpress wp user list --path=/var/www/html --allow-root
+	@echo "--- WordPress DB tables (stock install: 12 tables) ---"
+	$(COMPOSE) exec wordpress wp db tables --path=/var/www/html --allow-root
+
+check-restart:
+	docker inspect -f '{{.Name}}: {{.HostConfig.RestartPolicy.Name}}' mariadb wordpress nginx
+
+check-isolation:
+	@echo "--- mariadb (nginx must be absent) ---"
+	-$(COMPOSE) exec mariadb which nginx
+	@echo "--- wordpress (nginx must be absent) ---"
+	-$(COMPOSE) exec wordpress which nginx
+
+check: ps networks volumes check-tls check-wp check-restart check-isolation
+	@echo "All checks completed."
+
 clean:
 	$(COMPOSE) down -v
 
@@ -176,7 +203,29 @@ fclean: clean
 
 re: fclean up
 
-.PHONY: up down stop restart build logs ps images volumes networks clean fclean re
+help:
+	@echo "make up             - build and start all services"
+	@echo "make down           - stop and remove containers"
+	@echo "make stop           - stop containers without removing them"
+	@echo "make restart        - restart all services"
+	@echo "make build          - build images"
+	@echo "make logs           - follow logs"
+	@echo "make ps             - container status"
+	@echo "make images         - list built images"
+	@echo "make volumes        - inspect the named volumes"
+	@echo "make networks       - inspect the docker network"
+	@echo "make check-tls      - verify TLS 1.2/1.3 work, TLS 1.1 fails"
+	@echo "make check-wp       - list WordPress users"
+	@echo "make check-restart  - show each container's restart policy"
+	@echo "make check-isolation - confirm nginx is absent from wordpress/mariadb"
+	@echo "make check          - run all checks above in sequence"
+	@echo "make clean          - stop and remove containers, network, volumes"
+	@echo "make fclean         - clean, then delete persisted data"
+	@echo "make re             - fclean, then up"
+
+.PHONY: up down stop restart build logs ps images volumes networks \
+        check-tls check-wp check-restart check-isolation check \
+        clean fclean re help
 EOF
 
 # docker-compose.yml is generated (not executed as a shell script), so $HOST_HOME
@@ -277,6 +326,15 @@ EXPOSE 3306
 CMD ["/usr/local/bin/entrypoint.sh"]
 EOF
 
+# Deliberately doesn't exclude conf/ or tools/ (needed by the COPY instructions above) -
+# only things that will never be needed inside the build context.
+cat > "$TARGET_DIR/srcs/requirements/mariadb/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
+EOF
+
 cat > "$TARGET_DIR/srcs/requirements/mariadb/conf/my.cnf" <<'EOF'
 [mysqld]
 user = mysql
@@ -298,6 +356,12 @@ MYSQL_ROOT_PASSWORD="$(cat /run/secrets/db_root_password)"
 
 mkdir -p /var/lib/mysql
 chown -R mysql:mysql /var/lib/mysql
+
+# Debian normally has systemd create this at boot (tmpfiles.d); since we exec mysqld
+# directly with no systemd in the container, nobody creates it otherwise, and mysqld
+# fails with "Bind on unix socket: No such file or directory" on every single start.
+mkdir -p /run/mysqld
+chown mysql:mysql /run/mysqld
 
 if [ ! -d /var/lib/mysql/mysql ]; then
   mariadb-install-db --user=mysql --datadir=/var/lib/mysql >/dev/null
@@ -336,6 +400,13 @@ RUN curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-
 
 EXPOSE 9000
 CMD ["/usr/local/bin/entrypoint.sh"]
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/wordpress/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
 EOF
 
 # Quoted heredoc for the same reason as the mariadb entrypoint: ${...} references are
@@ -418,6 +489,13 @@ EXPOSE 443
 CMD ["/usr/local/bin/entrypoint.sh"]
 EOF
 
+cat > "$TARGET_DIR/srcs/requirements/nginx/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
+EOF
+
 # Unquoted heredoc so ${DOMAIN_NAME} is baked in now (nginx.conf is a static file, never
 # executed as a shell script, so there's no other point at which it could be substituted).
 # nginx's own variables are escaped (\$uri, \$args, \$fastcgi_script_name) so bash leaves
@@ -438,6 +516,8 @@ http {
         ssl_certificate /etc/nginx/certs/server.crt;
         ssl_certificate_key /etc/nginx/certs/server.key;
         ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+        ssl_prefer_server_ciphers off;
 
         server_name ${DOMAIN_NAME};
 
@@ -582,10 +662,16 @@ Run these from the repository root (where the \`Makefile\` is):
 | List built images (check names match services) | \`make images\` |
 | Inspect the named volumes | \`make volumes\` |
 | Inspect the docker network | \`make networks\` |
+| Check TLS (1.2/1.3 work, 1.1 fails) | \`make check-tls\` |
+| List WordPress users | \`make check-wp\` |
+| Show each container's restart policy | \`make check-restart\` |
+| Confirm nginx is absent from wordpress/mariadb | \`make check-isolation\` |
+| Run all the checks above in sequence | \`make check\` |
 | Follow container logs | \`make logs\` |
 | Stop and remove containers + network | \`make clean\` |
 | Full reset, including \`/home/${LOGNAME_VALUE}/data\` | \`make fclean\` |
 | Full reset then restart | \`make re\` |
+| List all available commands | \`make help\` |
 
 ## Accessing the website and the admin panel
 - Website: https://${DOMAIN_NAME}
@@ -611,8 +697,13 @@ make ps                          # all three should show "running"
 make logs                        # tail logs for all services
 make networks                    # "inception" network should exist
 make volumes                     # mariadb_data / wordpress_data should exist
-curl -vk https://${DOMAIN_NAME}  # -k: ignore the self-signed cert
+make check-tls                   # TLS 1.2/1.3 work, TLS 1.1 fails
+make check-wp                    # the 2 WordPress users exist, with the right roles
+make check-restart                # each container's restart policy
+make check-isolation              # nginx is absent from wordpress/mariadb
+make check                        # runs all of the above in sequence
 \`\`\`
+Or just \`make help\` to list every available command.
 EOF
 
 cat > "$TARGET_DIR/DEV_DOC.md" <<EOF
@@ -659,6 +750,12 @@ make ps        # container status
 make images    # list built images
 make volumes   # docker volume ls/inspect
 make networks  # docker network ls/inspect
+make check-tls       # curl + openssl s_client checks (1.2/1.3 ok, 1.1 fails)
+make check-wp        # list WordPress users
+make check-restart   # show each container's restart policy
+make check-isolation # confirm nginx is absent from wordpress/mariadb
+make check           # run all checks above in sequence
+make help            # list every available command
 \`\`\`
 The \`Makefile\` always passes \`--env-file srcs/.env\` explicitly, so \`make\` works from the
 repo root regardless of shell working directory assumptions.

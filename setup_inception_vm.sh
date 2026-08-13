@@ -69,6 +69,10 @@ mkdir -p "$TARGET_DIR/srcs/requirements/nginx/conf" \
          "$TARGET_DIR/srcs/requirements/wordpress/tools" \
          "$TARGET_DIR/srcs/requirements/mariadb/conf" \
          "$TARGET_DIR/srcs/requirements/mariadb/tools" \
+         "$TARGET_DIR/srcs/requirements/bonus/static-site/site" \
+         "$TARGET_DIR/srcs/requirements/bonus/adminer" \
+         "$TARGET_DIR/srcs/requirements/bonus/prometheus/conf" \
+         "$TARGET_DIR/srcs/requirements/bonus/node-exporter" \
          "$TARGET_DIR/secrets"
 
 mkdir -p "$HOST_HOME/data/mariadb" "$HOST_HOME/data/wordpress"
@@ -133,6 +137,7 @@ EOF
 
 cat > "$TARGET_DIR/Makefile" <<'EOF'
 COMPOSE = docker compose -f srcs/docker-compose.yml --env-file srcs/.env
+BONUS   = $(COMPOSE) --profile bonus
 DOMAIN  = $(shell grep -m1 '^DOMAIN_NAME=' srcs/.env | cut -d= -f2)
 
 all: up
@@ -195,6 +200,30 @@ check-isolation:
 check: ps networks volumes check-tls check-wp check-restart check-isolation
 	@echo "All checks completed."
 
+# --- Bonus (only assessed once the mandatory part above is perfect) ---
+# Bonus services carry the "bonus" compose profile, so plain `make up` never starts
+# them; only these targets (via --profile bonus) do.
+bonus-up:
+	$(BONUS) up -d --build
+
+bonus-down:
+	$(BONUS) down
+
+bonus-ps:
+	$(BONUS) ps
+
+bonus-logs:
+	$(BONUS) logs -f static-site adminer prometheus node-exporter
+
+check-bonus:
+	$(BONUS) ps
+	@echo "--- static site ---"
+	curl -sI http://$(DOMAIN):8080 | head -1
+	@echo "--- adminer ---"
+	curl -sI http://$(DOMAIN):8081 | head -1
+	@echo "--- prometheus targets (should list node-exporter as up) ---"
+	curl -s http://$(DOMAIN):9090/api/v1/targets | grep -o '"health":"[a-z]*"'
+
 clean:
 	$(COMPOSE) down -v
 
@@ -219,12 +248,18 @@ help:
 	@echo "make check-restart  - show each container's restart policy"
 	@echo "make check-isolation - confirm nginx is absent from wordpress/mariadb"
 	@echo "make check          - run all checks above in sequence"
+	@echo "make bonus-up       - build and start mandatory + bonus services"
+	@echo "make bonus-down     - stop the bonus services"
+	@echo "make bonus-ps       - bonus container status"
+	@echo "make bonus-logs     - follow bonus service logs"
+	@echo "make check-bonus    - verify static site, Adminer and Prometheus respond"
 	@echo "make clean          - stop and remove containers, network, volumes"
 	@echo "make fclean         - clean, then delete persisted data"
 	@echo "make re             - fclean, then up"
 
 .PHONY: up down stop restart build logs ps images volumes networks \
         check-tls check-wp check-restart check-isolation check \
+        bonus-up bonus-down bonus-ps bonus-logs check-bonus \
         clean fclean re help
 EOF
 
@@ -285,6 +320,64 @@ services:
     networks:
       - inception
     restart: unless-stopped
+
+  static-site:
+    image: static-site
+    container_name: static-site
+    build:
+      context: ./requirements/bonus/static-site
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  adminer:
+    image: adminer
+    container_name: adminer
+    build:
+      context: ./requirements/bonus/adminer
+      dockerfile: Dockerfile
+    depends_on:
+      - mariadb
+    ports:
+      - "8081:8081"
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  node-exporter:
+    image: node-exporter
+    container_name: node-exporter
+    build:
+      context: ./requirements/bonus/node-exporter
+      dockerfile: Dockerfile
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  prometheus:
+    image: prometheus
+    container_name: prometheus
+    build:
+      context: ./requirements/bonus/prometheus
+      dockerfile: Dockerfile
+    depends_on:
+      - node-exporter
+    ports:
+      - "9090:9090"
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
 
 volumes:
   mariadb_data:
@@ -560,6 +653,146 @@ if [ ! -f /etc/nginx/certs/server.crt ]; then
 fi
 
 exec nginx -g 'daemon off;'
+EOF
+
+# =============================================================================
+# BONUS: static site, Adminer, Prometheus + node-exporter
+# All bonus services are tagged with the "bonus" compose profile, so `make up`
+# (mandatory only) never starts them; only `make bonus-up` does.
+# =============================================================================
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/static-site/Dockerfile" <<'EOF'
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y python3 && rm -rf /var/lib/apt/lists/*
+
+COPY site /var/www/static
+WORKDIR /var/www/static
+
+EXPOSE 8080
+CMD ["python3", "-m", "http.server", "8080"]
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/static-site/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/static-site/site/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>${LOGNAME_VALUE} — Inception</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>${LOGNAME_VALUE}</h1>
+    <p>42 student — this static site is the Inception bonus showcase page.</p>
+    <p>Served by Python's built-in <code>http.server</code>, no PHP involved.</p>
+  </main>
+</body>
+</html>
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/static-site/site/style.css" <<'EOF'
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #16232c;
+  color: #e4edef;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  margin: 0;
+}
+main {
+  max-width: 40rem;
+  padding: 2rem;
+}
+h1 {
+  color: #e0836a;
+}
+code {
+  background: #0b1319;
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+}
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/adminer/Dockerfile" <<'EOF'
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y php-cli php-mysql curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /var/www/adminer \
+ && curl -fsSL https://www.adminer.org/latest.php -o /var/www/adminer/index.php
+WORKDIR /var/www/adminer
+
+EXPOSE 8081
+CMD ["php", "-S", "0.0.0.0:8081", "-t", "/var/www/adminer"]
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/adminer/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/prometheus/Dockerfile" <<'EOF'
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y prometheus && rm -rf /var/lib/apt/lists/*
+
+COPY conf/prometheus.yml /etc/prometheus/prometheus.yml
+
+EXPOSE 9090
+CMD ["/usr/bin/prometheus", \
+     "--config.file=/etc/prometheus/prometheus.yml", \
+     "--storage.tsdb.path=/prometheus"]
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/prometheus/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/prometheus/conf/prometheus.yml" <<'EOF'
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/node-exporter/Dockerfile" <<'EOF'
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y prometheus-node-exporter \
+ && rm -rf /var/lib/apt/lists/*
+
+EXPOSE 9100
+CMD ["/usr/bin/prometheus-node-exporter"]
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/node-exporter/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
 EOF
 
 cat > "$TARGET_DIR/README.md" <<EOF

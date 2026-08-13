@@ -198,7 +198,11 @@ check-tls:
 	@echo "--- TLS 1.2 (must succeed) ---"
 	openssl s_client -connect $(DOMAIN):443 -tls1_2 </dev/null 2>&1 | grep -i "Verify\|Protocol"
 	@echo "--- TLS 1.1 (must fail) ---"
-	-openssl s_client -connect $(DOMAIN):443 -tls1_1 </dev/null 2>&1 | grep -i "handshake failure\|no protocols"
+	@if openssl s_client -connect $(DOMAIN):443 -tls1_1 </dev/null 2>&1 | grep -qi "Cipher is (NONE)\|no protocols\|alert"; then \
+		echo "OK: TLS 1.1 rejected"; \
+	else \
+		echo "FAIL: TLS 1.1 connection was NOT rejected"; \
+	fi
 	@echo "--- Port 80 (must be refused, nginx only publishes 443) ---"
 	-curl -sv http://$(DOMAIN) 2>&1 | grep -i "connection refused\|failed to connect"
 
@@ -212,9 +216,17 @@ check-restart:
 
 check-isolation:
 	@echo "--- mariadb (nginx must be absent) ---"
-	-$(COMPOSE) exec mariadb which nginx
+	@if $(COMPOSE) exec mariadb which nginx >/dev/null 2>&1; then \
+		echo "FAIL: nginx found inside mariadb"; \
+	else \
+		echo "OK: nginx absent from mariadb"; \
+	fi
 	@echo "--- wordpress (nginx must be absent) ---"
-	-$(COMPOSE) exec wordpress which nginx
+	@if $(COMPOSE) exec wordpress which nginx >/dev/null 2>&1; then \
+		echo "FAIL: nginx found inside wordpress"; \
+	else \
+		echo "OK: nginx absent from wordpress"; \
+	fi
 
 check: ps networks volumes check-tls check-wp check-restart check-isolation
 	@echo "All checks completed."

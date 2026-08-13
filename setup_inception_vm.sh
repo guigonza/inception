@@ -73,6 +73,10 @@ mkdir -p "$TARGET_DIR/srcs/requirements/nginx/conf" \
          "$TARGET_DIR/srcs/requirements/bonus/adminer" \
          "$TARGET_DIR/srcs/requirements/bonus/prometheus/conf" \
          "$TARGET_DIR/srcs/requirements/bonus/node-exporter" \
+         "$TARGET_DIR/srcs/requirements/bonus/redis/conf" \
+         "$TARGET_DIR/srcs/requirements/bonus/redis/tools" \
+         "$TARGET_DIR/srcs/requirements/bonus/ftp/conf" \
+         "$TARGET_DIR/srcs/requirements/bonus/ftp/tools" \
          "$TARGET_DIR/secrets"
 
 mkdir -p "$HOST_HOME/data/mariadb" "$HOST_HOME/data/wordpress"
@@ -83,10 +87,15 @@ MYSQL_DATABASE="wordpress"
 MYSQL_USER="wpuser"
 MYSQL_ROOT_PASSWORD="$(openssl rand -hex 16)"
 MYSQL_PASSWORD="$(openssl rand -hex 16)"
+FTP_PASSWORD="$(openssl rand -hex 16)"
+REDIS_PASSWORD="$(openssl rand -hex 16)"
 
 # WordPress admin username MUST NOT contain "admin" or "administrator" (case-insensitive).
+# A suffix like "${LOGNAME_VALUE}_owner" would still contain "admin" as a substring if the
+# login itself does (e.g. login "admin" -> "admin_owner"), so the fallback below is fully
+# independent of the login instead of just appending to it.
 if echo "$LOGNAME_VALUE" | grep -qi 'admin'; then
-  WP_ADMIN_USER="${LOGNAME_VALUE}_owner"
+  WP_ADMIN_USER="owner_$(echo -n "$LOGNAME_VALUE" | md5sum | cut -c1-6)"
 else
   WP_ADMIN_USER="${LOGNAME_VALUE}"
 fi
@@ -95,6 +104,7 @@ WP_ADMIN_EMAIL="${WP_ADMIN_USER}@${DOMAIN_NAME}"
 WP_TITLE="Inception"
 WP_USER="${LOGNAME_VALUE}_user"
 WP_USER_PASSWORD="$(openssl rand -hex 16)"
+FTP_USER="${LOGNAME_VALUE}_ftp"
 
 # Make the domain resolve locally on this VM (browser is expected to run on the VM itself).
 if ! grep -qF "$DOMAIN_NAME" /etc/hosts 2>/dev/null; then
@@ -110,6 +120,7 @@ WP_ADMIN_USER=$WP_ADMIN_USER
 WP_ADMIN_EMAIL=$WP_ADMIN_EMAIL
 WP_TITLE=$WP_TITLE
 WP_USER=$WP_USER
+FTP_USER=$FTP_USER
 EOF
 
 # --- Secrets: consumed via Docker secrets (/run/secrets/*), never as build args or bare env vars ---
@@ -124,6 +135,14 @@ EOF
 cat > "$TARGET_DIR/secrets/credentials.txt" <<EOF
 WP_ADMIN_PASSWORD=$WP_ADMIN_PASSWORD
 WP_USER_PASSWORD=$WP_USER_PASSWORD
+EOF
+
+cat > "$TARGET_DIR/secrets/ftp_password.txt" <<EOF
+$FTP_PASSWORD
+EOF
+
+cat > "$TARGET_DIR/secrets/redis_password.txt" <<EOF
+$REDIS_PASSWORD
 EOF
 
 chmod 600 "$TARGET_DIR/secrets/"*.txt
@@ -213,7 +232,7 @@ bonus-ps:
 	$(BONUS) ps
 
 bonus-logs:
-	$(BONUS) logs -f static-site adminer prometheus node-exporter
+	$(BONUS) logs -f static-site adminer prometheus node-exporter redis ftp
 
 check-bonus:
 	$(BONUS) ps
@@ -223,12 +242,16 @@ check-bonus:
 	curl -sI http://$(DOMAIN):8081 | head -1
 	@echo "--- prometheus targets (should list node-exporter as up) ---"
 	curl -s http://$(DOMAIN):9090/api/v1/targets | grep -o '"health":"[a-z]*"'
+	@echo "--- redis (wordpress object cache status) ---"
+	-$(COMPOSE) exec wordpress wp redis status --path=/var/www/html --allow-root
+	@echo "--- ftp (port 21 reachable) ---"
+	-nc -z -w2 $(DOMAIN) 21 && echo "FTP port 21: open" || echo "FTP port 21: closed"
 
 clean:
 	$(COMPOSE) down -v
 
 fclean: clean
-	rm -rf $(PWD)/data
+	rm -rf $(HOME)/data/mariadb $(HOME)/data/wordpress
 
 re: fclean up
 
@@ -252,7 +275,7 @@ help:
 	@echo "make bonus-down     - stop the bonus services"
 	@echo "make bonus-ps       - bonus container status"
 	@echo "make bonus-logs     - follow bonus service logs"
-	@echo "make check-bonus    - verify static site, Adminer and Prometheus respond"
+	@echo "make check-bonus    - verify static site, Adminer, Prometheus, Redis and FTP respond"
 	@echo "make clean          - stop and remove containers, network, volumes"
 	@echo "make fclean         - clean, then delete persisted data"
 	@echo "make re             - fclean, then up"
@@ -268,7 +291,7 @@ EOF
 cat > "$TARGET_DIR/srcs/docker-compose.yml" <<EOF
 services:
   mariadb:
-    image: mariadb
+    image: mariadb:inception
     container_name: mariadb
     build:
       context: ./requirements/mariadb
@@ -285,7 +308,7 @@ services:
     restart: unless-stopped
 
   wordpress:
-    image: wordpress
+    image: wordpress:inception
     container_name: wordpress
     build:
       context: ./requirements/wordpress
@@ -295,6 +318,7 @@ services:
     secrets:
       - db_password
       - credentials
+      - redis_password
     depends_on:
       - mariadb
     volumes:
@@ -304,7 +328,7 @@ services:
     restart: unless-stopped
 
   nginx:
-    image: nginx
+    image: nginx:inception
     container_name: nginx
     build:
       context: ./requirements/nginx
@@ -322,7 +346,7 @@ services:
     restart: unless-stopped
 
   static-site:
-    image: static-site
+    image: static-site:inception
     container_name: static-site
     build:
       context: ./requirements/bonus/static-site
@@ -336,7 +360,7 @@ services:
       - bonus
 
   adminer:
-    image: adminer
+    image: adminer:inception
     container_name: adminer
     build:
       context: ./requirements/bonus/adminer
@@ -352,7 +376,7 @@ services:
       - bonus
 
   node-exporter:
-    image: node-exporter
+    image: node-exporter:inception
     container_name: node-exporter
     build:
       context: ./requirements/bonus/node-exporter
@@ -363,8 +387,43 @@ services:
     profiles:
       - bonus
 
+  redis:
+    image: redis:inception
+    container_name: redis
+    build:
+      context: ./requirements/bonus/redis
+      dockerfile: Dockerfile
+    secrets:
+      - redis_password
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  ftp:
+    image: ftp:inception
+    container_name: ftp
+    build:
+      context: ./requirements/bonus/ftp
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    secrets:
+      - ftp_password
+    volumes:
+      - wordpress_data:/var/www/html
+    ports:
+      - "21:21"
+      - "21100-21110:21100-21110"
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
   prometheus:
-    image: prometheus
+    image: prometheus:inception
     container_name: prometheus
     build:
       context: ./requirements/bonus/prometheus
@@ -404,6 +463,10 @@ secrets:
     file: ../secrets/db_root_password.txt
   credentials:
     file: ../secrets/credentials.txt
+  ftp_password:
+    file: ../secrets/ftp_password.txt
+  redis_password:
+    file: ../secrets/redis_password.txt
 EOF
 
 cat > "$TARGET_DIR/srcs/requirements/mariadb/Dockerfile" <<'EOF'
@@ -486,7 +549,7 @@ FROM debian:12-slim
 
 RUN apt-get update \
  && apt-get install -y \
-   php-fpm php-cli php-mysql php-curl php-xml php-mbstring php-zip \
+   php-fpm php-cli php-mysql php-curl php-xml php-mbstring php-zip php-redis \
    wget curl unzip default-mysql-client less gnupg ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
@@ -563,6 +626,18 @@ if [ ! -f /var/www/html/wp-config.php ]; then
   export PATH="${PATH}:/usr/local/bin"
   wp core install --url="https://${DOMAIN_NAME}" --title="${WP_TITLE}" --admin_user="${WP_ADMIN_USER}" --admin_password="${WP_ADMIN_PASSWORD}" --admin_email="${WP_ADMIN_EMAIL}" --path=/var/www/html --allow-root
   wp user create "${WP_USER}" "${WP_USER}@${DOMAIN_NAME}" --user_pass="${WP_USER_PASSWORD}" --role=author --path=/var/www/html --allow-root
+
+  # Bonus: only wired up when the "redis" container is actually reachable on the network
+  # (i.e. the stack was started with the "bonus" compose profile). This keeps the
+  # mandatory-only stack fully functional even though the plugin is always attempted here.
+  if getent hosts redis >/dev/null 2>&1; then
+    echo "Redis detected - enabling WordPress object cache..."
+    REDIS_PASSWORD="$(cat /run/secrets/redis_password)"
+    wp plugin install redis-cache --activate --path=/var/www/html --allow-root
+    wp config set WP_REDIS_HOST redis --path=/var/www/html --allow-root
+    wp config set WP_REDIS_PASSWORD "${REDIS_PASSWORD}" --path=/var/www/html --allow-root
+    wp redis enable --path=/var/www/html --allow-root || true
+  fi
 
   chown -R www-data:www-data /var/www/html
 fi
@@ -793,6 +868,102 @@ cat > "$TARGET_DIR/srcs/requirements/bonus/node-exporter/.dockerignore" <<'EOF'
 .gitignore
 *.md
 .DS_Store
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/redis/Dockerfile" <<'EOF'
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y redis-server && rm -rf /var/lib/apt/lists/*
+
+COPY conf/redis.conf /etc/redis/redis.conf
+COPY tools/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 6379
+CMD ["/usr/local/bin/entrypoint.sh"]
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/redis/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/redis/conf/redis.conf" <<'EOF'
+bind 0.0.0.0
+protected-mode yes
+port 6379
+maxmemory 64mb
+maxmemory-policy allkeys-lru
+EOF
+
+# The password is never baked into redis.conf (no password in Dockerfiles/images); it is
+# read from the Docker secret and passed as a CLI flag at container start instead.
+cat > "$TARGET_DIR/srcs/requirements/bonus/redis/tools/entrypoint.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REDIS_PASSWORD="$(cat /run/secrets/redis_password)"
+
+exec /usr/bin/redis-server /etc/redis/redis.conf --requirepass "${REDIS_PASSWORD}"
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/ftp/Dockerfile" <<'EOF'
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y vsftpd && rm -rf /var/lib/apt/lists/*
+
+COPY conf/vsftpd.conf /etc/vsftpd.conf
+COPY tools/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 21 21100-21110
+CMD ["/usr/local/bin/entrypoint.sh"]
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/ftp/.dockerignore" <<'EOF'
+.git
+.gitignore
+*.md
+.DS_Store
+EOF
+
+cat > "$TARGET_DIR/srcs/requirements/bonus/ftp/conf/vsftpd.conf" <<'EOF'
+listen=YES
+listen_ipv6=NO
+anonymous_enable=NO
+local_enable=YES
+write_enable=YES
+chroot_local_user=YES
+allow_writeable_chroot=YES
+local_umask=022
+pasv_enable=YES
+pasv_min_port=21100
+pasv_max_port=21110
+seccomp_sandbox=NO
+EOF
+
+# FTP_USER comes from .env (non-secret), the password from the ftp_password Docker secret.
+# The user is created at runtime (not baked into the image) with its primary group set to
+# www-data, and the wordpress volume is made group-writable, so both php-fpm (running as
+# www-data) and this FTP user can read/write the same files without changing ownership.
+cat > "$TARGET_DIR/srcs/requirements/bonus/ftp/tools/entrypoint.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+FTP_PASSWORD="$(cat /run/secrets/ftp_password)"
+
+grep -qxF /usr/sbin/nologin /etc/shells || echo /usr/sbin/nologin >> /etc/shells
+
+if ! id "${FTP_USER}" >/dev/null 2>&1; then
+  useradd -d /var/www/html -g www-data -s /usr/sbin/nologin "${FTP_USER}"
+fi
+echo "${FTP_USER}:${FTP_PASSWORD}" | chpasswd
+
+chmod -R g+w /var/www/html
+
+exec /usr/sbin/vsftpd /etc/vsftpd.conf
 EOF
 
 cat > "$TARGET_DIR/README.md" <<EOF
@@ -1031,6 +1202,8 @@ chmod +x "$TARGET_DIR/setup_inception_vm.sh" 2>/dev/null || true
 chmod +x "$TARGET_DIR/srcs/requirements/mariadb/tools/entrypoint.sh"
 chmod +x "$TARGET_DIR/srcs/requirements/wordpress/tools/entrypoint.sh"
 chmod +x "$TARGET_DIR/srcs/requirements/nginx/tools/entrypoint.sh"
+chmod +x "$TARGET_DIR/srcs/requirements/bonus/redis/tools/entrypoint.sh"
+chmod +x "$TARGET_DIR/srcs/requirements/bonus/ftp/tools/entrypoint.sh"
 
 cat <<EOF
 Inception scaffold created in: $TARGET_DIR

@@ -63,6 +63,16 @@ if [[ "$HOST_USER" != "root" ]]; then
   usermod -aG docker "$HOST_USER" || true
 fi
 
+# Debian ships Firefox as "firefox-esr" (no plain "firefox" package in the repos);
+# Ubuntu's "firefox" is a transitional package that pulls it in via snap. "make open"
+# below looks for either binary, so installing under its native name on each OS is enough.
+# --no-install-recommends skips the extra spell-check dictionaries, locale packs, etc.
+# apt would otherwise pull in, for a leaner install on a VM that only needs the browser.
+case "$OS_ID" in
+  debian) apt-get install -y --no-install-recommends firefox-esr ;;
+  ubuntu) apt-get install -y --no-install-recommends firefox || true ;;
+esac
+
 install -d -m 0755 "$TARGET_DIR"
 mkdir -p "$TARGET_DIR/srcs/requirements/nginx/conf" \
          "$TARGET_DIR/srcs/requirements/nginx/tools" \
@@ -161,8 +171,24 @@ DOMAIN  = $(shell grep -m1 '^DOMAIN_NAME=' srcs/.env | cut -d= -f2)
 
 all: up
 
-up:
+# The named volumes are bind-mounted (via driver_opts) to $(HOME)/data/{mariadb,wordpress}
+# on the host. Docker does NOT create that host path on its own for this kind of mount -
+# it must already exist, or "up" fails the first time on a machine where it wasn't
+# provisioned by setup_inception_vm.sh (e.g. after moving/copying this project elsewhere).
+data-dirs:
+	mkdir -p $(HOME)/data/mariadb $(HOME)/data/wordpress
+
+up: data-dirs
 	$(COMPOSE) up -d --build
+
+open:
+	@BROWSER="$$(command -v firefox || command -v firefox-esr)"; \
+	if [ -z "$$BROWSER" ]; then \
+		echo "firefox no está instalado (sudo apt-get install -y firefox-esr)"; \
+		exit 1; \
+	fi; \
+	echo "Abriendo https://$(DOMAIN) con $$BROWSER..."; \
+	nohup "$$BROWSER" "https://$(DOMAIN)" >/dev/null 2>&1 &
 
 down:
 	$(COMPOSE) down
@@ -234,7 +260,7 @@ check: ps networks volumes check-tls check-wp check-restart check-isolation
 # --- Bonus (only assessed once the mandatory part above is perfect) ---
 # Bonus services carry the "bonus" compose profile, so plain `make up` never starts
 # them; only these targets (via --profile bonus) do.
-bonus-up:
+bonus-up: data-dirs
 	$(BONUS) up -d --build
 
 bonus-down:
@@ -269,6 +295,7 @@ re: fclean up
 
 help:
 	@echo "make up             - build and start all services"
+	@echo "make open           - open the site in firefox"
 	@echo "make down           - stop and remove containers"
 	@echo "make stop           - stop containers without removing them"
 	@echo "make restart        - restart all services"
@@ -292,7 +319,7 @@ help:
 	@echo "make fclean         - clean, then delete persisted data"
 	@echo "make re             - fclean, then up"
 
-.PHONY: up down stop restart build logs ps images volumes networks \
+.PHONY: up data-dirs open down stop restart build logs ps images volumes networks \
         check-tls check-wp check-restart check-isolation check \
         bonus-up bonus-down bonus-ps bonus-logs check-bonus \
         clean fclean re help
@@ -1216,6 +1243,13 @@ chmod +x "$TARGET_DIR/srcs/requirements/wordpress/tools/entrypoint.sh"
 chmod +x "$TARGET_DIR/srcs/requirements/nginx/tools/entrypoint.sh"
 chmod +x "$TARGET_DIR/srcs/requirements/bonus/redis/tools/entrypoint.sh"
 chmod +x "$TARGET_DIR/srcs/requirements/bonus/ftp/tools/entrypoint.sh"
+
+# The whole scaffold was written as root (this script runs under sudo); hand it back to
+# the invoking user so they can run "make", "git init", etc. without needing sudo for
+# every command inside their own project directory.
+if [[ "$HOST_USER" != "root" ]]; then
+  chown -R "$HOST_USER:$HOST_USER" "$TARGET_DIR" 2>/dev/null || true
+fi
 
 cat <<EOF
 Inception scaffold created in: $TARGET_DIR

@@ -1,0 +1,178 @@
+services:
+  mariadb:
+    image: mariadb:inception
+    container_name: mariadb
+    build:
+      context: ./requirements/mariadb
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    secrets:
+      - db_password
+      - db_root_password
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    networks:
+      - inception
+    restart: unless-stopped
+
+  wordpress:
+    image: wordpress:inception
+    container_name: wordpress
+    build:
+      context: ./requirements/wordpress
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    secrets:
+      - db_password
+      - credentials
+      - redis_password
+    depends_on:
+      - mariadb
+    volumes:
+      - wordpress_data:/var/www/html
+    networks:
+      - inception
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:inception
+    container_name: nginx
+    build:
+      context: ./requirements/nginx
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      - wordpress
+    ports:
+      - "443:443"
+    volumes:
+      - wordpress_data:/var/www/html
+    networks:
+      - inception
+    restart: unless-stopped
+
+  static-site:
+    image: static-site:inception
+    container_name: static-site
+    build:
+      context: ./requirements/bonus/static-site
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  adminer:
+    image: adminer:inception
+    container_name: adminer
+    build:
+      context: ./requirements/bonus/adminer
+      dockerfile: Dockerfile
+    depends_on:
+      - mariadb
+    ports:
+      - "8081:8081"
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  node-exporter:
+    image: node-exporter:inception
+    container_name: node-exporter
+    build:
+      context: ./requirements/bonus/node-exporter
+      dockerfile: Dockerfile
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  redis:
+    image: redis:inception
+    container_name: redis
+    build:
+      context: ./requirements/bonus/redis
+      dockerfile: Dockerfile
+    secrets:
+      - redis_password
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  ftp:
+    image: ftp:inception
+    container_name: ftp
+    build:
+      context: ./requirements/bonus/ftp
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    secrets:
+      - ftp_password
+    volumes:
+      - wordpress_data:/var/www/html
+    ports:
+      - "21:21"
+      - "21100-21110:21100-21110"
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+  prometheus:
+    image: prometheus:inception
+    container_name: prometheus
+    build:
+      context: ./requirements/bonus/prometheus
+      dockerfile: Dockerfile
+    depends_on:
+      - node-exporter
+    ports:
+      - "9090:9090"
+    networks:
+      - inception
+    restart: unless-stopped
+    profiles:
+      - bonus
+
+volumes:
+  mariadb_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /home/guigonza/data/mariadb
+      o: bind
+  wordpress_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /home/guigonza/data/wordpress
+      o: bind
+
+networks:
+  inception:
+    driver: bridge
+
+secrets:
+  db_password:
+    file: ../secrets/db_password.txt
+  db_root_password:
+    file: ../secrets/db_root_password.txt
+  credentials:
+    file: ../secrets/credentials.txt
+  ftp_password:
+    file: ../secrets/ftp_password.txt
+  redis_password:
+    file: ../secrets/redis_password.txt
